@@ -1,0 +1,8 @@
+[package]
+authors = ["49nord GmbH <hallo@49nord.de>"]
+name = "process_guard"
+version = "0.1.0"
+
+[dependencies]
+nix = "0.11.0"
+ticktock = "0.7.0"
