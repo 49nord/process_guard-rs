@@ -8,8 +8,7 @@
 //! use std::process;
 //!
 //! fn insomnia() {
-//!     let cmd = process::Command::new("sleep").arg("120");
-//!     let pg = ProcessGuard::spawn(cmd);
+//!     let pg = ProcessGuard::spawn(process::Command::new("sleep").arg("120"));
 //!
 //!     // a two-minute sleep process has been started, which will be killed as soon as this
 //!     // function returns
