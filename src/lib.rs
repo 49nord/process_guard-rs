@@ -19,7 +19,7 @@
 extern crate nix;
 extern crate ticktock;
 
-use std::{io, mem, process, time};
+use std::{io, process, time};
 
 /// Retry an IO operation if it returns with `EINTR`.
 #[inline]
@@ -87,11 +87,17 @@ impl ProcessGuard {
         let child = cmd.spawn()?;
         Ok(unsafe { Self::new(child, Some(grace_time)) })
     }
-}
 
-impl Drop for ProcessGuard {
-    fn drop(&mut self) {
-        if let Some(ref mut child) = self.child {
+    /// Shut the process down
+    ///
+    /// Calling `shutdown()` on a guard whose process has already exited is a no-op. Note that
+    /// a process whose shutdown failed is also considered shutdown, even though it might still be
+    /// running.
+    pub fn shutdown(&mut self) -> io::Result<Option<process::ExitStatus>> {
+        // remove child from parent struct to satisfy the borrow checker
+        let mut child_opt = self.take();
+
+        if let Some(ref mut child) = child_opt {
             // NOTE: we assume that it is impossible for a child's PID to be reused before it has
             //       been reaped, i.e. since we are the first to call `wait` on it, we should never
             //       kill the wrong process
@@ -115,7 +121,9 @@ impl Drop for ProcessGuard {
                         // process did not exit yet, keep polling
                         Ok(None) => continue,
                         // process did exit, we are done
-                        Ok(_) => return,
+                        Ok(Some(status)) => {
+                            return Ok(Some(status));
+                        }
                         // error occured - we won't keep trying to wait, but will make another
                         // effort using SIGKILL
                         Err(_) => break,
@@ -124,10 +132,21 @@ impl Drop for ProcessGuard {
             }
 
             // SIGTERM was either not requested or unsuccessful, proceed with SIGKILL
-            io_retry(|| child.kill()).ok();
+            // if SIGKILL fails, we keep the child around, but do not wait on it
+            io_retry(|| child.kill())?;
 
             // now wait is bound work. if it fails, we give up
-            io_retry(|| child.wait()).ok();
+            Ok(Some(io_retry(|| child.wait())?))
+        } else {
+            Ok(None)
         }
+    }
+}
+
+impl Drop for ProcessGuard {
+    #[inline]
+    fn drop(&mut self) {
+        // FIXME: log if shutdown fails
+        self.shutdown();
     }
 }
