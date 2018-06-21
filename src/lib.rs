@@ -56,7 +56,7 @@ impl ProcessGuard {
     /// Spawns a command
     ///
     /// Equivalent to calling `cmd.spawn()`, followed by `new`.
-    pub fn spawn(mut cmd: process::Command) -> io::Result<ProcessGuard> {
+    pub fn spawn(cmd: &mut process::Command) -> io::Result<ProcessGuard> {
         let child = cmd.spawn()?;
         Ok(unsafe { Self::new(child, None) })
     }
@@ -65,7 +65,7 @@ impl ProcessGuard {
     ///
     /// Equivalent to calling `cmd.spawn()`, followed by `new`.
     pub fn spawn_graceful(
-        mut cmd: process::Command,
+        cmd: &mut process::Command,
         grace_time: time::Duration,
     ) -> io::Result<ProcessGuard> {
         let child = cmd.spawn()?;
