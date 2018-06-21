@@ -37,6 +37,7 @@ fn io_retry<T, F: FnMut() -> io::Result<T>>(mut f: F) -> io::Result<T> {
 const POLL_INTERVAL: time::Duration = time::Duration::from_millis(100);
 
 /// Protects a process from becoming an orphan or zombie by killing it when the guard is dropped
+#[derive(Debug)]
 pub struct ProcessGuard {
     /// Child process. The process might be removed prematurely, in which case we do not kill
     /// anything
