@@ -1,13 +1,14 @@
 [package]
 authors = ["49nord GmbH <hello@49nord.de>"]
-name = "process_guard"
-version = "0.1.2"
-license = "MIT"
-repository = "https://github.com/49nord/process_guard-rs"
-documentation = "https://docs.rs/process_guard"
-readme = "README.md"
 description = "Guard a process by terminating it on drop"
+documentation = "https://docs.rs/process_guard"
+license = "MIT"
+name = "process_guard"
+readme = "README.md"
+repository = "https://github.com/49nord/process_guard-rs"
+version = "0.1.2"
 
 [dependencies]
+log = "0.4.2"
 nix = "0.11.0"
 ticktock = "0.7.0"

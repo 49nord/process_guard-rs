@@ -15,6 +15,8 @@
 //! }
 //! ```
 
+#[macro_use]
+extern crate log;
 extern crate nix;
 extern crate ticktock;
 
@@ -145,7 +147,10 @@ impl ProcessGuard {
 impl Drop for ProcessGuard {
     #[inline]
     fn drop(&mut self) {
-        // FIXME: log if shutdown fails
-        self.shutdown();
+        let pid = self.child.as_ref().map(|c| c.id()).unwrap_or(0);
+
+        if let Err(e) = self.shutdown() {
+            warn!("Could not cleanly kill PID {}: {:?}", pid, e);
+        }
     }
 }
