@@ -2,6 +2,9 @@
 authors = ["49nord GmbH <hallo@49nord.de>"]
 name = "process_guard"
 version = "0.1.0"
+license = "MIT"
+repository = "https://github.com/49nord/process_guard-rs"
+docs = "https://docs.rs/process_guard"
 
 [dependencies]
 nix = "0.11.0"
