@@ -109,7 +109,7 @@ impl ProcessGuard {
                 nix::sys::signal::kill(
                     nix::unistd::Pid::from_raw(child.id() as i32),
                     nix::sys::signal::Signal::SIGTERM,
-                ).ok();
+                ).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
                 // until we reach `grace_time`, try to reap the child in POLL_INTERVAL intervals
                 for _ in ticktock::clock::Clock::new(POLL_INTERVAL)
