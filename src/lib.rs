@@ -65,11 +65,8 @@ impl ProcessGuard {
     }
 
     /// Retrieves the child process from the process guard
-    pub fn into_inner(mut self) -> Option<process::Child> {
-        let mut child = None;
-
-        mem::swap(&mut self.child, &mut child);
-        child
+    pub fn take(&mut self) -> Option<process::Child> {
+        self.child.take()
     }
 
     /// Spawns a command
