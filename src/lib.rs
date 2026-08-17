@@ -15,7 +15,7 @@
 //! }
 //! ```
 
-use std::{io, process, thread, time};
+use std::{io, os::unix::process::CommandExt, process, thread, time};
 
 /// Retry an IO operation if it returns with `EINTR`.
 #[inline]
@@ -74,6 +74,15 @@ pub enum ShutdownPolicy {
     },
 }
 
+/// Identifies the operating-system object that receives shutdown signals.
+#[derive(Clone, Copy, Debug)]
+enum Target {
+    /// Sends signals only to the direct child.
+    Child,
+    /// Sends signals to a dedicated process group.
+    ProcessGroup(nix::unistd::Pid),
+}
+
 /// Protects a process from becoming an orphan or zombie by killing it when the guard is dropped
 #[derive(Debug)]
 pub struct ProcessGuard {
@@ -83,6 +92,9 @@ pub struct ProcessGuard {
 
     /// Policy used when shutting down the process.
     policy: ShutdownPolicy,
+
+    /// Object that receives shutdown signals.
+    target: Target,
 }
 
 impl ProcessGuard {
@@ -102,6 +114,7 @@ impl ProcessGuard {
         ProcessGuard {
             child: Some(child),
             policy,
+            target: Target::Child,
         }
     }
 
@@ -142,6 +155,24 @@ impl ProcessGuard {
         Ok(Self::with_policy(child, policy))
     }
 
+    /// Spawns a command as the leader of a dedicated process group.
+    ///
+    /// Shutdown signals are sent to the complete process group. The returned guard owns and reaps
+    /// only the direct child.
+    pub fn spawn_process_group(
+        cmd: &mut process::Command,
+        policy: ShutdownPolicy,
+    ) -> io::Result<ProcessGuard> {
+        cmd.process_group(0);
+        let child = cmd.spawn()?;
+        let process_group = nix::unistd::Pid::from_raw(child.id() as i32);
+        Ok(ProcessGuard {
+            child: Some(child),
+            policy,
+            target: Target::ProcessGroup(process_group),
+        })
+    }
+
     /// Shuts the process down and reaps it.
     ///
     /// Returns `None` if the guard no longer owns a process. If shutdown fails, the process remains
@@ -151,7 +182,7 @@ impl ProcessGuard {
             return Ok(None);
         };
 
-        let result = shutdown_child(child, self.policy);
+        let result = shutdown_child(child, self.policy, self.target);
         match result {
             Ok(status) => {
                 self.child.take();
@@ -166,6 +197,7 @@ impl ProcessGuard {
 fn shutdown_child(
     child: &mut process::Child,
     policy: ShutdownPolicy,
+    target: Target,
 ) -> io::Result<process::ExitStatus> {
     if let Some(status) = io_retry(|| child.try_wait())? {
         return Ok(status);
@@ -173,11 +205,7 @@ fn shutdown_child(
 
     // An unreaped child retains its PID, so it cannot be reused between this check and wait.
     if let ShutdownPolicy::Graceful { signal, grace_time } = policy {
-        let signal_result = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(child.id() as i32),
-            signal.as_nix(),
-        )
-        .map_err(io::Error::from);
+        let signal_result = send_signal(child, target, signal);
 
         if signal_result.is_ok() {
             let started = time::Instant::now();
@@ -199,13 +227,27 @@ fn shutdown_child(
         }
     }
 
-    match io_retry(|| child.kill()) {
+    match send_signal(child, target, Signal::Kill) {
         Ok(()) => io_retry(|| child.wait()),
         Err(kill_error) => match io_retry(|| child.try_wait()) {
             Ok(Some(status)) => Ok(status),
             Ok(None) | Err(_) => Err(kill_error),
         },
     }
+}
+
+/// Sends a signal to a child or its dedicated process group.
+fn send_signal(child: &process::Child, target: Target, signal: Signal) -> io::Result<()> {
+    let result = match target {
+        Target::Child => nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child.id() as i32),
+            signal.as_nix(),
+        ),
+        Target::ProcessGroup(process_group) => {
+            nix::sys::signal::killpg(process_group, signal.as_nix())
+        }
+    };
+    result.map_err(io::Error::from)
 }
 
 impl Drop for ProcessGuard {
@@ -221,7 +263,7 @@ impl Drop for ProcessGuard {
 
 #[cfg(test)]
 mod tests {
-    use std::{io, io::Read, process, time};
+    use std::{fs, io, io::Read, process, thread, time};
 
     use super::{ProcessGuard, ShutdownPolicy, Signal};
 
@@ -288,6 +330,57 @@ mod tests {
 
             assert!(guard.shutdown()?.is_some());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn process_group_shutdown_reaches_descendants() -> io::Result<()> {
+        let pid_file =
+            std::env::temp_dir().join(format!("process-guard-{}-group-child.pid", process::id()));
+        let _ = fs::remove_file(&pid_file);
+
+        let mut command = process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(
+                "sleep 60 & child=$!; trap 'wait \"$child\"; exit 0' TERM; \
+                 printf '%s' \"$child\" > \"$1\"; wait \"$child\"",
+            )
+            .arg("sh")
+            .arg(&pid_file);
+        let mut guard = ProcessGuard::spawn_process_group(
+            &mut command,
+            ShutdownPolicy::Graceful {
+                signal: Signal::Terminate,
+                grace_time: time::Duration::from_secs(1),
+            },
+        )?;
+
+        let started = time::Instant::now();
+        let descendant = loop {
+            if let Ok(pid) = fs::read_to_string(&pid_file) {
+                break nix::unistd::Pid::from_raw(pid.parse().map_err(io::Error::other)?);
+            }
+            if started.elapsed() >= time::Duration::from_secs(1) {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "child did not report its PID",
+                ));
+            }
+            thread::sleep(time::Duration::from_millis(10));
+        };
+
+        let status = guard
+            .shutdown()?
+            .expect("the guard still owns the running child");
+        let descendant_alive = nix::sys::signal::kill(descendant, None).is_ok();
+        if descendant_alive {
+            let _ = nix::sys::signal::kill(descendant, nix::sys::signal::Signal::SIGKILL);
+        }
+        fs::remove_file(pid_file)?;
+
+        assert!(status.success());
+        assert!(!descendant_alive);
         Ok(())
     }
 
