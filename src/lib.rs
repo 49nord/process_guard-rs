@@ -118,6 +118,11 @@ impl ProcessGuard {
         }
     }
 
+    /// Returns the direct child's process identifier.
+    pub fn id(&self) -> Option<u32> {
+        self.child.as_ref().map(process::Child::id)
+    }
+
     /// Retrieves the child process from the process guard
     pub fn take(&mut self) -> Option<process::Child> {
         self.child.take()
@@ -171,6 +176,58 @@ impl ProcessGuard {
             policy,
             target: Target::ProcessGroup(process_group),
         })
+    }
+
+    /// Sends a signal to the guarded child or process group.
+    ///
+    /// Returns the direct child's exit status if it had already exited. `None` means either that
+    /// the signal was delivered or that the guard no longer owns a child.
+    pub fn signal(&mut self, signal: Signal) -> io::Result<Option<process::ExitStatus>> {
+        if matches!(self.target, Target::Child) {
+            if let Some(status) = self.try_wait()? {
+                return Ok(Some(status));
+            }
+        }
+
+        let Some(child) = self.child.as_mut() else {
+            return Ok(None);
+        };
+        let result = send_signal(child, self.target, signal);
+        if let Err(signal_error) = result {
+            return match self.try_wait() {
+                Ok(Some(status)) => Ok(Some(status)),
+                Ok(None) | Err(_) => Err(signal_error),
+            };
+        }
+        Ok(None)
+    }
+
+    /// Checks whether the direct child has exited without blocking.
+    ///
+    /// A completed child is reaped and removed from the guard. `None` means either that the child
+    /// remains running or that the guard no longer owns one.
+    pub fn try_wait(&mut self) -> io::Result<Option<process::ExitStatus>> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(None);
+        };
+        let status = io_retry(|| child.try_wait())?;
+        if status.is_some() {
+            self.child.take();
+        }
+        Ok(status)
+    }
+
+    /// Waits for and reaps the direct child without requesting shutdown.
+    ///
+    /// Returns `None` if the guard no longer owns a child. Waiting for a process-group leader does
+    /// not wait for other members of that group.
+    pub fn wait(&mut self) -> io::Result<Option<process::ExitStatus>> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(None);
+        };
+        let status = io_retry(|| child.wait())?;
+        self.child.take();
+        Ok(Some(status))
     }
 
     /// Shuts the process down and reaps it.
@@ -381,6 +438,25 @@ mod tests {
 
         assert!(status.success());
         assert!(!descendant_alive);
+        Ok(())
+    }
+
+    #[test]
+    fn signal_and_wait_reap_a_running_child() -> io::Result<()> {
+        let mut command = process::Command::new("sleep");
+        command.arg("60");
+        let mut guard = ProcessGuard::spawn(&mut command)?;
+
+        assert!(guard.id().is_some());
+        assert!(guard.try_wait()?.is_none());
+        assert!(guard.signal(Signal::Kill)?.is_none());
+
+        let status = guard
+            .wait()?
+            .expect("the guard still owns the signaled child");
+        assert!(!status.success());
+        assert!(guard.id().is_none());
+        assert!(guard.wait()?.is_none());
         Ok(())
     }
 
