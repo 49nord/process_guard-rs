@@ -115,30 +115,39 @@ fn shutdown_child(
 
     // An unreaped child retains its PID, so it cannot be reused between this check and wait.
     if let Some(grace_time) = grace_time {
-        nix::sys::signal::kill(
+        let signal_result = nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(child.id() as i32),
             nix::sys::signal::Signal::SIGTERM,
         )
-        .map_err(io::Error::other)?;
+        .map_err(io::Error::from);
 
-        let started = time::Instant::now();
-        loop {
-            match io_retry(|| child.try_wait()) {
-                Ok(None) => {}
-                Ok(Some(status)) => return Ok(status),
-                Err(_) => break,
-            }
+        if signal_result.is_ok() {
+            let started = time::Instant::now();
+            loop {
+                match io_retry(|| child.try_wait()) {
+                    Ok(None) => {}
+                    Ok(Some(status)) => return Ok(status),
+                    Err(_) => break,
+                }
 
-            let remaining = grace_time.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                break;
+                let remaining = grace_time.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    break;
+                }
+                thread::sleep(POLL_INTERVAL.min(remaining));
             }
-            thread::sleep(POLL_INTERVAL.min(remaining));
+        } else if let Ok(Some(status)) = io_retry(|| child.try_wait()) {
+            return Ok(status);
         }
     }
 
-    io_retry(|| child.kill())?;
-    io_retry(|| child.wait())
+    match io_retry(|| child.kill()) {
+        Ok(()) => io_retry(|| child.wait()),
+        Err(kill_error) => match io_retry(|| child.try_wait()) {
+            Ok(Some(status)) => Ok(status),
+            Ok(None) | Err(_) => Err(kill_error),
+        },
+    }
 }
 
 impl Drop for ProcessGuard {
@@ -178,6 +187,17 @@ mod tests {
 
         assert!(status.success());
         assert!(guard.shutdown()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn graceful_shutdown_handles_fast_exit_races() -> io::Result<()> {
+        for _ in 0..100 {
+            let mut command = process::Command::new("true");
+            let mut guard = ProcessGuard::spawn_graceful(&mut command, time::Duration::ZERO)?;
+
+            assert!(guard.shutdown()?.is_some());
+        }
         Ok(())
     }
 
