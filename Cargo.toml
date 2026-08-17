@@ -2,7 +2,7 @@
 authors = ["49nord GmbH <hello@49nord.de>"]
 description = "Guard a process by terminating it on drop"
 documentation = "https://docs.rs/process_guard"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 name = "process_guard"
 readme = "README.md"
 repository = "https://github.com/49nord/process_guard-rs"
