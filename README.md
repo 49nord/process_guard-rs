@@ -47,6 +47,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 `take` returns the direct child and relinquishes all cleanup responsibility, including cleanup of an owned process group.
 
+The guard reaps only the direct child. After forceful shutdown it returns once `SIGKILL` has been sent to the process group and the direct child has been reaped; other members may remain briefly visible while termination and reaping complete.
+
+Process-group containment is cooperative. Descendants can escape cleanup by joining another process group with `setpgid` or starting another session with `setsid`.
+
 ## Lifecycle limits
 
 Cleanup through `Drop` only runs when Rust destructors execute. It does not run when the owning process is terminated by `SIGKILL`, calls `abort`, or exits through another path that bypasses unwinding. Applications should handle ordinary termination signals and return through normal control flow. Surviving abrupt parent death requires an independent watchdog process.
