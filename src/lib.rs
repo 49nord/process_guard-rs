@@ -29,7 +29,7 @@ fn io_retry<T, F: FnMut() -> io::Result<T>>(mut f: F) -> io::Result<T> {
     loop {
         match f() {
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            r @ _ => break r,
+            r => break r,
         }
     }
 }
@@ -52,7 +52,7 @@ pub struct ProcessGuard {
 impl ProcessGuard {
     /// Create a new child process
     ///
-    /// # unsafe
+    /// # Safety
     ///
     /// It is unsafe to put any arbitrary child process into a process guard, mainly because the
     /// guard relies on the child not having been waited on beforehand. Otherwise, it cannot be
@@ -111,7 +111,8 @@ impl ProcessGuard {
                 nix::sys::signal::kill(
                     nix::unistd::Pid::from_raw(child.id() as i32),
                     nix::sys::signal::Signal::SIGTERM,
-                ).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                )
+                .map_err(io::Error::other)?;
 
                 // until we reach `grace_time`, try to reap the child in POLL_INTERVAL intervals
                 for _ in ticktock::clock::Clock::new(POLL_INTERVAL)
