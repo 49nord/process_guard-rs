@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Process groups
 
-`ProcessGuard::spawn_process_group` starts the direct child as the leader of a dedicated process group. Graceful and forceful shutdown signals are sent to the complete group, while the direct child is reaped by the guard. This is useful when a command creates subprocesses that must not outlive it.
+`ProcessGuard::spawn_process_group` starts the direct child as the leader of a dedicated process group. `ShutdownPolicy::Graceful` asks the direct child to coordinate shutdown, while `ShutdownPolicy::GracefulProcessGroup` broadcasts the graceful signal. Forceful fallback always signals the complete group. The guard reaps the direct child.
 
 `wait`, `try_wait`, and `take` operate on the direct child. Calling one of them can relinquish process-group cleanup after the leader exits, so process-group owners should normally use `shutdown`.
 

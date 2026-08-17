@@ -27,7 +27,14 @@ pub enum ShutdownPolicy {
     Kill,
     /// Requests graceful shutdown before forcing termination.
     Graceful {
-        /// Signal used to request graceful shutdown.
+        /// Signal sent to the direct child to request graceful shutdown.
+        signal: Signal,
+        /// Maximum time allowed for graceful shutdown.
+        grace_time: time::Duration,
+    },
+    /// Requests graceful shutdown from the complete process group before forcing termination.
+    GracefulProcessGroup {
+        /// Signal sent to the process group to request graceful shutdown.
         signal: Signal,
         /// Maximum time allowed for graceful shutdown.
         grace_time: time::Duration,
@@ -265,7 +272,7 @@ fn shutdown_direct_child(
     }
 
     // An unreaped child retains its PID, so it cannot be reused between this check and wait.
-    if let ShutdownPolicy::Graceful { signal, grace_time } = policy {
+    if let Some((signal, grace_time)) = graceful_shutdown(policy) {
         let signal_result = send_signal(child, Target::Child, signal);
 
         if signal_result.is_ok() {
@@ -300,8 +307,13 @@ fn shutdown_process_group(
     let target = Target::ProcessGroup(process_group);
     let mut child_status = None;
 
-    if let ShutdownPolicy::Graceful { signal, grace_time } = policy {
-        let _ = send_signal(child, target, signal);
+    if let Some((signal, grace_time)) = graceful_shutdown(policy) {
+        let graceful_target = match policy {
+            ShutdownPolicy::Graceful { .. } => Target::Child,
+            ShutdownPolicy::GracefulProcessGroup { .. } => target,
+            ShutdownPolicy::Kill => unreachable!("graceful policy was checked above"),
+        };
+        let _ = send_signal(child, graceful_target, signal);
         let started = time::Instant::now();
 
         loop {
@@ -337,6 +349,15 @@ fn shutdown_process_group(
     match child_status {
         Some(status) => Ok(status),
         None => io_retry(|| child.wait()).map_err(|source| ShutdownError::Wait { source }),
+    }
+}
+
+/// Returns the graceful signal and grace period configured by a policy.
+fn graceful_shutdown(policy: ShutdownPolicy) -> Option<(Signal, time::Duration)> {
+    match policy {
+        ShutdownPolicy::Kill => None,
+        ShutdownPolicy::Graceful { signal, grace_time }
+        | ShutdownPolicy::GracefulProcessGroup { signal, grace_time } => Some((signal, grace_time)),
     }
 }
 
@@ -532,7 +553,7 @@ mod tests {
             .arg(&pid_file);
         let mut guard = ProcessGuard::spawn_process_group(
             &mut command,
-            ShutdownPolicy::Graceful {
+            ShutdownPolicy::GracefulProcessGroup {
                 signal: Signal::SIGTERM,
                 grace_time: time::Duration::from_secs(1),
             },
