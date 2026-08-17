@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 `GracefulProcessGroup` broadcasts only when the guard created and owns a dedicated group. On a direct-child guard it behaves like `Graceful`; the guard never discovers or signals the child's inherited process group, which could also contain the caller or its parent.
 
-`wait`, `try_wait`, and `take` operate on the direct child. Calling one of them can relinquish process-group cleanup after the leader exits, so process-group owners should normally use `shutdown`.
+`take` returns the direct child and relinquishes all cleanup responsibility, including cleanup of an owned process group.
 
 ## Lifecycle limits
 
