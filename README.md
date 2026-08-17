@@ -25,7 +25,7 @@ use std::{process::Command, time::Duration};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let policy = ShutdownPolicy::Graceful {
-        signal: Signal::Interrupt,
+        signal: Signal::SIGINT,
         grace_time: Duration::from_secs(5),
     };
     let mut command = Command::new("postgres");

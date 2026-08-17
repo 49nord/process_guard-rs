@@ -17,38 +17,13 @@ fn io_retry<T, F: FnMut() -> io::Result<T>>(mut f: F) -> io::Result<T> {
 /// Defines the interval used while polling for process exit.
 const POLL_INTERVAL: time::Duration = time::Duration::from_millis(100);
 
-/// Identifies a signal that can be sent to a guarded process.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Signal {
-    /// Requests that a process reload its configuration or terminate.
-    Hangup,
-    /// Requests an interrupt-driven shutdown.
-    Interrupt,
-    /// Forces immediate termination.
-    Kill,
-    /// Requests termination and a core dump.
-    Quit,
-    /// Requests an orderly shutdown.
-    Terminate,
-}
-
-impl Signal {
-    /// Returns the platform signal represented by this value.
-    fn as_nix(self) -> nix::sys::signal::Signal {
-        match self {
-            Self::Hangup => nix::sys::signal::Signal::SIGHUP,
-            Self::Interrupt => nix::sys::signal::Signal::SIGINT,
-            Self::Kill => nix::sys::signal::Signal::SIGKILL,
-            Self::Quit => nix::sys::signal::Signal::SIGQUIT,
-            Self::Terminate => nix::sys::signal::Signal::SIGTERM,
-        }
-    }
-}
+/// Signal that can be sent to a guarded process.
+pub type Signal = nix::sys::signal::Signal;
 
 /// Configures how a guarded process is shut down.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShutdownPolicy {
-    /// Forces immediate termination with [`Signal::Kill`].
+    /// Forces immediate termination with [`Signal::SIGKILL`].
     Kill,
     /// Requests graceful shutdown before forcing termination.
     Graceful {
@@ -118,7 +93,7 @@ impl ProcessGuard {
     pub fn new(child: process::Child, grace_time: Option<time::Duration>) -> ProcessGuard {
         let policy = grace_time.map_or(ShutdownPolicy::Kill, |grace_time| {
             ShutdownPolicy::Graceful {
-                signal: Signal::Terminate,
+                signal: Signal::SIGTERM,
                 grace_time,
             }
         });
@@ -161,7 +136,7 @@ impl ProcessGuard {
         Self::spawn_with_policy(
             cmd,
             ShutdownPolicy::Graceful {
-                signal: Signal::Terminate,
+                signal: Signal::SIGTERM,
                 grace_time,
             },
         )
@@ -351,7 +326,7 @@ fn shutdown_process_group(
         }
     }
 
-    let kill_result = send_signal(child, target, Signal::Kill);
+    let kill_result = send_signal(child, target, Signal::SIGKILL);
     if let Err(kill_error) = kill_result {
         let group_exists = process_group_exists(process_group).unwrap_or(true);
         if group_exists {
@@ -370,7 +345,7 @@ fn force_shutdown(
     child: &mut process::Child,
     target: Target,
 ) -> Result<process::ExitStatus, ShutdownError> {
-    match send_signal(child, target, Signal::Kill) {
+    match send_signal(child, target, Signal::SIGKILL) {
         Ok(()) => io_retry(|| child.wait()).map_err(|source| ShutdownError::Wait { source }),
         Err(kill_error) => match io_retry(|| child.try_wait()) {
             Ok(Some(status)) => Ok(status),
@@ -391,13 +366,10 @@ fn process_group_exists(process_group: nix::unistd::Pid) -> io::Result<bool> {
 /// Sends a signal to a child or its dedicated process group.
 fn send_signal(child: &process::Child, target: Target, signal: Signal) -> io::Result<()> {
     let result = match target {
-        Target::Child => nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(child.id() as i32),
-            signal.as_nix(),
-        ),
-        Target::ProcessGroup(process_group) => {
-            nix::sys::signal::killpg(process_group, signal.as_nix())
+        Target::Child => {
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(child.id() as i32), signal)
         }
+        Target::ProcessGroup(process_group) => nix::sys::signal::killpg(process_group, signal),
     };
     result.map_err(io::Error::from)
 }
@@ -462,7 +434,7 @@ mod tests {
         let mut guard = ProcessGuard::with_policy(
             child,
             ShutdownPolicy::Graceful {
-                signal: Signal::Interrupt,
+                signal: Signal::SIGINT,
                 grace_time: time::Duration::from_secs(1),
             },
         );
@@ -503,7 +475,7 @@ mod tests {
         let mut guard = ProcessGuard::spawn_process_group(
             &mut command,
             ShutdownPolicy::Graceful {
-                signal: Signal::Terminate,
+                signal: Signal::SIGTERM,
                 grace_time: time::Duration::from_secs(1),
             },
         )?;
@@ -555,7 +527,7 @@ mod tests {
         let mut guard = ProcessGuard::spawn_process_group(
             &mut command,
             ShutdownPolicy::Graceful {
-                signal: Signal::Terminate,
+                signal: Signal::SIGTERM,
                 grace_time: time::Duration::from_millis(50),
             },
         )?;
@@ -605,7 +577,7 @@ mod tests {
 
         assert!(guard.id().is_some());
         assert!(guard.try_wait()?.is_none());
-        assert!(guard.signal(Signal::Kill)?.is_none());
+        assert!(guard.signal(Signal::SIGKILL)?.is_none());
 
         let status = guard
             .wait()?
