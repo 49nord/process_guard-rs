@@ -15,10 +15,6 @@
 //! }
 //! ```
 
-#[macro_use]
-extern crate log;
-extern crate nix;
-
 use std::{io, process, thread, time};
 
 /// Retry an IO operation if it returns with `EINTR`.
@@ -151,7 +147,7 @@ impl Drop for ProcessGuard {
         let pid = self.child.as_ref().map(|c| c.id()).unwrap_or(0);
 
         if let Err(e) = self.shutdown() {
-            warn!("Could not cleanly kill PID {}: {:?}", pid, e);
+            log::warn!("Could not cleanly kill PID {}: {:?}", pid, e);
         }
     }
 }

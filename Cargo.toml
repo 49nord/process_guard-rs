@@ -7,6 +7,8 @@ name = "process_guard"
 readme = "README.md"
 repository = "https://github.com/49nord/process_guard-rs"
 version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
 
 [dependencies]
 log = "0.4.2"
