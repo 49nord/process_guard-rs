@@ -14,6 +14,9 @@ fn io_retry<T, F: FnMut() -> io::Result<T>>(mut f: F) -> io::Result<T> {
     }
 }
 
+/// Maximum time allowed for graceful shutdown by the default policy.
+pub const DEFAULT_GRACE_TIME: time::Duration = time::Duration::from_secs(10);
+
 /// Defines the interval used while polling for process exit.
 const POLL_INTERVAL: time::Duration = time::Duration::from_millis(100);
 
@@ -39,6 +42,15 @@ pub enum ShutdownPolicy {
         /// Maximum time allowed for graceful shutdown.
         grace_time: time::Duration,
     },
+}
+
+impl Default for ShutdownPolicy {
+    fn default() -> Self {
+        Self::Graceful {
+            signal: Signal::SIGTERM,
+            grace_time: DEFAULT_GRACE_TIME,
+        }
+    }
 }
 
 /// Describes a failure that prevented a guarded child from being shut down.
@@ -126,11 +138,9 @@ impl ProcessGuard {
         self.child.take()
     }
 
-    /// Spawns a command with forceful shutdown.
-    ///
-    /// Equivalent to spawning `cmd` and calling [`ProcessGuard::new`] without a grace period.
+    /// Spawns a command with the default shutdown policy.
     pub fn spawn(cmd: &mut process::Command) -> io::Result<ProcessGuard> {
-        Self::spawn_with_policy(cmd, ShutdownPolicy::Kill)
+        Self::spawn_with_policy(cmd, ShutdownPolicy::default())
     }
 
     /// Spawns a command with graceful `SIGTERM` shutdown.
@@ -410,7 +420,19 @@ impl Drop for ProcessGuard {
 mod tests {
     use std::{fs, io, io::Read, process, thread, time};
 
-    use super::{ProcessGuard, ShutdownPolicy, Signal};
+    use super::{DEFAULT_GRACE_TIME, ProcessGuard, ShutdownPolicy, Signal};
+
+    #[test]
+    fn default_policy_gracefully_terminates_for_ten_seconds() {
+        assert_eq!(
+            ShutdownPolicy::default(),
+            ShutdownPolicy::Graceful {
+                signal: Signal::SIGTERM,
+                grace_time: DEFAULT_GRACE_TIME,
+            }
+        );
+        assert_eq!(DEFAULT_GRACE_TIME, time::Duration::from_secs(10));
+    }
 
     #[test]
     fn shutdown_reaps_a_completed_child() -> io::Result<()> {

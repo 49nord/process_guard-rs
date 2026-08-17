@@ -1,6 +1,6 @@
 # process_guard
 
-`process_guard` owns a child process and shuts it down when explicitly requested or when the guard is dropped. Shutdown can target either the direct child or a dedicated process group.
+`process_guard` owns a child process and shuts it down when explicitly requested or when the guard is dropped. By default it sends `SIGTERM`, waits up to 10 seconds, and then sends `SIGKILL`. Shutdown can target either the direct child or a dedicated process group.
 
 ```rust,no_run
 use process_guard::ProcessGuard;
@@ -11,7 +11,7 @@ fn main() -> std::io::Result<()> {
     command.arg("120");
     let guard = ProcessGuard::spawn(&mut command)?;
 
-    // The child receives SIGKILL and is reaped when the guard is dropped.
+    // The child is gracefully shut down and reaped when the guard is dropped.
     drop(guard);
     Ok(())
 }
