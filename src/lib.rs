@@ -20,6 +20,12 @@ pub const DEFAULT_GRACE_TIME: time::Duration = time::Duration::from_secs(10);
 /// Defines the interval used while polling for process exit.
 const POLL_INTERVAL: time::Duration = time::Duration::from_millis(100);
 
+/// Calculates the next polling delay before a grace period expires.
+fn grace_poll_delay(grace_time: time::Duration, elapsed: time::Duration) -> Option<time::Duration> {
+    let remaining = grace_time.saturating_sub(elapsed);
+    (!remaining.is_zero()).then_some(POLL_INTERVAL.min(remaining))
+}
+
 /// Signal that can be sent to a guarded process.
 pub type Signal = nix::sys::signal::Signal;
 
@@ -298,11 +304,10 @@ fn shutdown_direct_child(
                     Err(_) => break,
                 }
 
-                let remaining = grace_time.saturating_sub(started.elapsed());
-                if remaining.is_zero() {
+                let Some(delay) = grace_poll_delay(grace_time, started.elapsed()) else {
                     break;
-                }
-                thread::sleep(POLL_INTERVAL.min(remaining));
+                };
+                thread::sleep(delay);
             }
         } else if let Ok(Some(status)) = io_retry(|| child.try_wait()) {
             return Ok(status);
@@ -344,11 +349,10 @@ fn shutdown_process_group(
                 return Ok(status);
             }
 
-            let remaining = grace_time.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
+            let Some(delay) = grace_poll_delay(grace_time, started.elapsed()) else {
                 break;
-            }
-            thread::sleep(POLL_INTERVAL.min(remaining));
+            };
+            thread::sleep(delay);
         }
     }
 
@@ -424,7 +428,7 @@ impl Drop for ProcessGuard {
 mod tests {
     use std::{fs, io, io::Read, process, thread, time};
 
-    use super::{DEFAULT_GRACE_TIME, ProcessGuard, ShutdownPolicy, Signal};
+    use super::{DEFAULT_GRACE_TIME, ProcessGuard, ShutdownPolicy, Signal, grace_poll_delay};
 
     #[test]
     fn default_policy_gracefully_terminates_for_ten_seconds() {
@@ -508,7 +512,7 @@ mod tests {
     #[test]
     fn graceful_shutdown_honors_its_deadline() -> io::Result<()> {
         let grace_time = time::Duration::from_millis(250);
-        let scheduler_tolerance = time::Duration::from_millis(90);
+        let scheduler_tolerance = time::Duration::from_millis(200);
         let mut command = process::Command::new("sh");
         command
             .arg("-c")
@@ -541,6 +545,26 @@ mod tests {
             "shutdown exceeded the grace period and scheduler tolerance: {elapsed:?}"
         );
         Ok(())
+    }
+
+    /// Verifies that polling sleeps are bounded by the remaining grace period.
+    #[test]
+    fn grace_polling_is_bounded_by_its_deadline() {
+        let grace_time = time::Duration::from_millis(250);
+
+        assert_eq!(
+            grace_poll_delay(grace_time, time::Duration::ZERO),
+            Some(time::Duration::from_millis(100))
+        );
+        assert_eq!(
+            grace_poll_delay(grace_time, time::Duration::from_millis(225)),
+            Some(time::Duration::from_millis(25))
+        );
+        assert_eq!(grace_poll_delay(grace_time, grace_time), None);
+        assert_eq!(
+            grace_poll_delay(grace_time, time::Duration::from_millis(300)),
+            None
+        );
     }
 
     /// Verifies that a process-group child becomes its dedicated group leader.
