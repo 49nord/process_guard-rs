@@ -35,7 +35,11 @@ pub enum ShutdownPolicy {
         /// Maximum time allowed for graceful shutdown.
         grace_time: time::Duration,
     },
-    /// Requests graceful shutdown from the complete process group before forcing termination.
+    /// Requests graceful shutdown from the complete guarded target before forcing termination.
+    ///
+    /// This broadcasts only for a guard created by [`ProcessGuard::spawn_process_group`]. For a
+    /// direct-child guard, it is equivalent to [`ShutdownPolicy::Graceful`] and never signals the
+    /// child's inherited process group.
     GracefulProcessGroup {
         /// Signal sent to the process group to request graceful shutdown.
         signal: Signal,
