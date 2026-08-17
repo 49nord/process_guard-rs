@@ -288,6 +288,17 @@ fn shutdown_child(
     policy: ShutdownPolicy,
     target: Target,
 ) -> Result<process::ExitStatus, ShutdownError> {
+    match target {
+        Target::Child => shutdown_direct_child(child, policy),
+        Target::ProcessGroup(process_group) => shutdown_process_group(child, process_group, policy),
+    }
+}
+
+/// Shuts down and reaps a direct child process.
+fn shutdown_direct_child(
+    child: &mut process::Child,
+    policy: ShutdownPolicy,
+) -> Result<process::ExitStatus, ShutdownError> {
     if let Some(status) =
         io_retry(|| child.try_wait()).map_err(|source| ShutdownError::Inspect { source })?
     {
@@ -296,7 +307,7 @@ fn shutdown_child(
 
     // An unreaped child retains its PID, so it cannot be reused between this check and wait.
     if let ShutdownPolicy::Graceful { signal, grace_time } = policy {
-        let signal_result = send_signal(child, target, signal);
+        let signal_result = send_signal(child, Target::Child, signal);
 
         if signal_result.is_ok() {
             let started = time::Instant::now();
@@ -318,12 +329,78 @@ fn shutdown_child(
         }
     }
 
+    force_shutdown(child, Target::Child)
+}
+
+/// Shuts down a process group and reaps its direct child.
+fn shutdown_process_group(
+    child: &mut process::Child,
+    process_group: nix::unistd::Pid,
+    policy: ShutdownPolicy,
+) -> Result<process::ExitStatus, ShutdownError> {
+    let target = Target::ProcessGroup(process_group);
+    let mut child_status = None;
+
+    if let ShutdownPolicy::Graceful { signal, grace_time } = policy {
+        let _ = send_signal(child, target, signal);
+        let started = time::Instant::now();
+
+        loop {
+            if child_status.is_none() {
+                match io_retry(|| child.try_wait()) {
+                    Ok(status) => child_status = status,
+                    Err(_) => break,
+                }
+            }
+
+            let group_exists = process_group_exists(process_group)
+                .map_err(|source| ShutdownError::Inspect { source })?;
+            if !group_exists && let Some(status) = child_status {
+                return Ok(status);
+            }
+
+            let remaining = grace_time.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            thread::sleep(POLL_INTERVAL.min(remaining));
+        }
+    }
+
+    let kill_result = send_signal(child, target, Signal::Kill);
+    if let Err(kill_error) = kill_result {
+        let group_exists = process_group_exists(process_group).unwrap_or(true);
+        if group_exists {
+            return Err(ShutdownError::Kill { source: kill_error });
+        }
+    }
+
+    match child_status {
+        Some(status) => Ok(status),
+        None => io_retry(|| child.wait()).map_err(|source| ShutdownError::Wait { source }),
+    }
+}
+
+/// Forces a direct child or process group to stop and reaps the direct child.
+fn force_shutdown(
+    child: &mut process::Child,
+    target: Target,
+) -> Result<process::ExitStatus, ShutdownError> {
     match send_signal(child, target, Signal::Kill) {
         Ok(()) => io_retry(|| child.wait()).map_err(|source| ShutdownError::Wait { source }),
         Err(kill_error) => match io_retry(|| child.try_wait()) {
             Ok(Some(status)) => Ok(status),
             Ok(None) | Err(_) => Err(ShutdownError::Kill { source: kill_error }),
         },
+    }
+}
+
+/// Checks whether a process group still has members.
+fn process_group_exists(process_group: nix::unistd::Pid) -> io::Result<bool> {
+    match nix::sys::signal::killpg(process_group, None) {
+        Ok(()) => Ok(true),
+        Err(nix::errno::Errno::ESRCH) => Ok(false),
+        Err(error) => Err(io::Error::from(error)),
     }
 }
 
@@ -465,6 +542,67 @@ mod tests {
             .shutdown()?
             .expect("the guard still owns the running child");
         let descendant_alive = nix::sys::signal::kill(descendant, None).is_ok();
+        if descendant_alive {
+            let _ = nix::sys::signal::kill(descendant, nix::sys::signal::Signal::SIGKILL);
+        }
+        fs::remove_file(pid_file)?;
+
+        assert!(status.success());
+        assert!(!descendant_alive);
+        Ok(())
+    }
+
+    #[test]
+    fn process_group_shutdown_kills_descendants_after_leader_exit() -> io::Result<()> {
+        let pid_file =
+            std::env::temp_dir().join(format!("process-guard-{}-orphan-child.pid", process::id()));
+        let _ = fs::remove_file(&pid_file);
+
+        let mut command = process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(
+                "sh -c 'trap \"\" TERM; printf \"%s\" \"$$\" > \"$1\"; \
+                 while :; do :; done' sh \"$1\" & \
+                 while [ ! -s \"$1\" ]; do :; done",
+            )
+            .arg("sh")
+            .arg(&pid_file);
+        let mut guard = ProcessGuard::spawn_process_group(
+            &mut command,
+            ShutdownPolicy::Graceful {
+                signal: Signal::Terminate,
+                grace_time: time::Duration::from_millis(50),
+            },
+        )?;
+
+        let started = time::Instant::now();
+        let descendant = loop {
+            if let Ok(pid) = fs::read_to_string(&pid_file) {
+                break nix::unistd::Pid::from_raw(pid.parse().map_err(io::Error::other)?);
+            }
+            if started.elapsed() >= time::Duration::from_secs(1) {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "descendant did not report its PID",
+                ));
+            }
+            thread::sleep(time::Duration::from_millis(10));
+        };
+
+        let status = guard
+            .shutdown()?
+            .expect("the guard still owns the completed group leader");
+        let started = time::Instant::now();
+        let descendant_alive = loop {
+            if nix::sys::signal::kill(descendant, None).is_err() {
+                break false;
+            }
+            if started.elapsed() >= time::Duration::from_secs(1) {
+                break true;
+            }
+            thread::sleep(time::Duration::from_millis(10));
+        };
         if descendant_alive {
             let _ = nix::sys::signal::kill(descendant, nix::sys::signal::Signal::SIGKILL);
         }
