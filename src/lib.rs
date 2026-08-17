@@ -45,15 +45,8 @@ pub struct ProcessGuard {
 }
 
 impl ProcessGuard {
-    /// Create a new child process
-    ///
-    /// # Safety
-    ///
-    /// It is unsafe to put any arbitrary child process into a process guard, mainly because the
-    /// guard relies on the child not having been waited on beforehand. Otherwise, it cannot be
-    /// guaranteed that the child process has not exited and its PID been reused, potentially
-    /// killing an innocent bystander process on `Drop`.
-    pub unsafe fn new(child: process::Child, grace_time: Option<time::Duration>) -> ProcessGuard {
+    /// Creates a guard for an existing child process.
+    pub fn new(child: process::Child, grace_time: Option<time::Duration>) -> ProcessGuard {
         ProcessGuard {
             child: Some(child),
             grace_time,
@@ -70,7 +63,7 @@ impl ProcessGuard {
     /// Equivalent to calling `cmd.spawn()`, followed by `new`.
     pub fn spawn(cmd: &mut process::Command) -> io::Result<ProcessGuard> {
         let child = cmd.spawn()?;
-        Ok(unsafe { Self::new(child, None) })
+        Ok(Self::new(child, None))
     }
 
     /// Spawns a command with a grace timeout
@@ -81,7 +74,7 @@ impl ProcessGuard {
         grace_time: time::Duration,
     ) -> io::Result<ProcessGuard> {
         let child = cmd.spawn()?;
-        Ok(unsafe { Self::new(child, Some(grace_time)) })
+        Ok(Self::new(child, Some(grace_time)))
     }
 
     /// Shuts the process down and reaps it.
@@ -180,7 +173,7 @@ mod tests {
             .expect("stdout was configured to be piped")
             .read_to_end(&mut output)?;
 
-        let mut guard = unsafe { ProcessGuard::new(child, Some(time::Duration::from_secs(1))) };
+        let mut guard = ProcessGuard::new(child, Some(time::Duration::from_secs(1)));
         let status = guard
             .shutdown()?
             .expect("the guard still owns the completed child");
