@@ -12,4 +12,4 @@ rust-version = "1.85"
 
 [dependencies]
 log = "0.4.33"
-nix = "0.11.0"
+nix = { version = "0.31.3", features = ["signal"] }
