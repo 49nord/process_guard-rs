@@ -1,6 +1,6 @@
 # process_guard
 
-`process_guard` owns a child process and shuts it down when explicitly requested or when the guard is dropped. By default it sends `SIGTERM`, waits up to 10 seconds, and then sends `SIGKILL`. Shutdown can target either the direct child or a dedicated process group.
+`process_guard` provides two-stage process cleanup for synchronous code through RAII. On `Drop`, it sends a configurable graceful signal (`SIGTERM` by default), waits for a bounded interval, escalates to `SIGKILL`, and reaps the direct child; the same operation is available explicitly and can target a child or dedicated process group.
 
 ```rust,no_run
 use process_guard::ProcessGuard;
@@ -54,3 +54,9 @@ Cleanup through `Drop` only runs when Rust destructors execute. It does not run 
 ## Platform support
 
 The crate uses Unix signals and process groups. Linux and arm64 macOS are tested in CI. Runtime validation has also been completed on macOS 15.5 on Apple Silicon. Windows and other Unix platforms are not currently supported.
+
+## Alternatives
+
+`process_guard`'s core functionality is synchronous `std::process::Child` ownership and two-stage `SIG*` -> `SIGKILL` cleanup from `Drop`. Async-focused alternatives include [`tokio-process-tools`](https://crates.io/crates/tokio-process-tools), Tokio's built-in [`kill_on_drop`](https://docs.rs/tokio/latest/tokio/process/struct.Command.html#method.kill_on_drop), or [`process-wrap`](https://crates.io/crates/process-wrap).
+
+Synchronous alternatives such as [`subprocess`](https://crates.io/crates/subprocess), [`process_control`](https://crates.io/crates/process_control), [`duct`](https://crates.io/crates/duct), [`shared_child`](https://crates.io/crates/shared_child), or [`kill_tree`](https://crates.io/crates/kill_tree) offer additional features, but do not offer the core two-stage RAII shutdown feature that `process_guard` is built around.
