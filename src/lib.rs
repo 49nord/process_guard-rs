@@ -32,6 +32,48 @@ fn io_retry<T, F: FnMut() -> io::Result<T>>(mut f: F) -> io::Result<T> {
 /// Interval used when polling, waiting for a process to exit
 const POLL_INTERVAL: time::Duration = time::Duration::from_millis(100);
 
+/// Identifies a signal that can be sent to a guarded process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Signal {
+    /// Requests that a process reload its configuration or terminate.
+    Hangup,
+    /// Requests an interrupt-driven shutdown.
+    Interrupt,
+    /// Forces immediate termination.
+    Kill,
+    /// Requests termination and a core dump.
+    Quit,
+    /// Requests an orderly shutdown.
+    Terminate,
+}
+
+impl Signal {
+    /// Returns the platform signal represented by this value.
+    fn as_nix(self) -> nix::sys::signal::Signal {
+        match self {
+            Self::Hangup => nix::sys::signal::Signal::SIGHUP,
+            Self::Interrupt => nix::sys::signal::Signal::SIGINT,
+            Self::Kill => nix::sys::signal::Signal::SIGKILL,
+            Self::Quit => nix::sys::signal::Signal::SIGQUIT,
+            Self::Terminate => nix::sys::signal::Signal::SIGTERM,
+        }
+    }
+}
+
+/// Configures how a guarded process is shut down.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShutdownPolicy {
+    /// Forces immediate termination with [`Signal::Kill`].
+    Kill,
+    /// Requests graceful shutdown before forcing termination.
+    Graceful {
+        /// Signal used to request graceful shutdown.
+        signal: Signal,
+        /// Maximum time allowed for graceful shutdown.
+        grace_time: time::Duration,
+    },
+}
+
 /// Protects a process from becoming an orphan or zombie by killing it when the guard is dropped
 #[derive(Debug)]
 pub struct ProcessGuard {
@@ -39,17 +81,27 @@ pub struct ProcessGuard {
     /// anything
     child: Option<process::Child>,
 
-    /// An optional grace time. If set, sends a `SIGTERM` and waits up to `grace_time` before
-    /// sending `SIGKILL`.
-    grace_time: Option<time::Duration>,
+    /// Policy used when shutting down the process.
+    policy: ShutdownPolicy,
 }
 
 impl ProcessGuard {
     /// Creates a guard for an existing child process.
     pub fn new(child: process::Child, grace_time: Option<time::Duration>) -> ProcessGuard {
+        let policy = grace_time.map_or(ShutdownPolicy::Kill, |grace_time| {
+            ShutdownPolicy::Graceful {
+                signal: Signal::Terminate,
+                grace_time,
+            }
+        });
+        Self::with_policy(child, policy)
+    }
+
+    /// Creates a guard with an explicit shutdown policy.
+    pub fn with_policy(child: process::Child, policy: ShutdownPolicy) -> ProcessGuard {
         ProcessGuard {
             child: Some(child),
-            grace_time,
+            policy,
         }
     }
 
@@ -62,8 +114,7 @@ impl ProcessGuard {
     ///
     /// Equivalent to calling `cmd.spawn()`, followed by `new`.
     pub fn spawn(cmd: &mut process::Command) -> io::Result<ProcessGuard> {
-        let child = cmd.spawn()?;
-        Ok(Self::new(child, None))
+        Self::spawn_with_policy(cmd, ShutdownPolicy::Kill)
     }
 
     /// Spawns a command with a grace timeout
@@ -73,8 +124,22 @@ impl ProcessGuard {
         cmd: &mut process::Command,
         grace_time: time::Duration,
     ) -> io::Result<ProcessGuard> {
+        Self::spawn_with_policy(
+            cmd,
+            ShutdownPolicy::Graceful {
+                signal: Signal::Terminate,
+                grace_time,
+            },
+        )
+    }
+
+    /// Spawns a command with an explicit shutdown policy.
+    pub fn spawn_with_policy(
+        cmd: &mut process::Command,
+        policy: ShutdownPolicy,
+    ) -> io::Result<ProcessGuard> {
         let child = cmd.spawn()?;
-        Ok(Self::new(child, Some(grace_time)))
+        Ok(Self::with_policy(child, policy))
     }
 
     /// Shuts the process down and reaps it.
@@ -86,7 +151,7 @@ impl ProcessGuard {
             return Ok(None);
         };
 
-        let result = shutdown_child(child, self.grace_time);
+        let result = shutdown_child(child, self.policy);
         match result {
             Ok(status) => {
                 self.child.take();
@@ -100,17 +165,17 @@ impl ProcessGuard {
 /// Shuts down and reaps an owned child process.
 fn shutdown_child(
     child: &mut process::Child,
-    grace_time: Option<time::Duration>,
+    policy: ShutdownPolicy,
 ) -> io::Result<process::ExitStatus> {
     if let Some(status) = io_retry(|| child.try_wait())? {
         return Ok(status);
     }
 
     // An unreaped child retains its PID, so it cannot be reused between this check and wait.
-    if let Some(grace_time) = grace_time {
+    if let ShutdownPolicy::Graceful { signal, grace_time } = policy {
         let signal_result = nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(child.id() as i32),
-            nix::sys::signal::Signal::SIGTERM,
+            signal.as_nix(),
         )
         .map_err(io::Error::from);
 
@@ -158,7 +223,7 @@ impl Drop for ProcessGuard {
 mod tests {
     use std::{io, io::Read, process, time};
 
-    use super::ProcessGuard;
+    use super::{ProcessGuard, ShutdownPolicy, Signal};
 
     #[test]
     fn shutdown_reaps_a_completed_child() -> io::Result<()> {
@@ -180,6 +245,38 @@ mod tests {
 
         assert!(status.success());
         assert!(guard.shutdown()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn graceful_shutdown_accepts_a_custom_signal() -> io::Result<()> {
+        let mut command = process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("trap 'exit 42' INT; printf ready; while :; do :; done")
+            .stdout(process::Stdio::piped());
+        let mut child = command.spawn()?;
+
+        let mut ready = [0; 5];
+        child
+            .stdout
+            .take()
+            .expect("stdout was configured to be piped")
+            .read_exact(&mut ready)?;
+        assert_eq!(&ready, b"ready");
+
+        let mut guard = ProcessGuard::with_policy(
+            child,
+            ShutdownPolicy::Graceful {
+                signal: Signal::Interrupt,
+                grace_time: time::Duration::from_secs(1),
+            },
+        );
+        let status = guard
+            .shutdown()?
+            .expect("the guard still owns the running child");
+
+        assert_eq!(status.code(), Some(42));
         Ok(())
     }
 
