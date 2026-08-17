@@ -51,4 +51,4 @@ Cleanup through `Drop` only runs when Rust destructors execute. It does not run 
 
 ## Platform support
 
-The crate uses Unix signals and process groups. Linux is tested in CI. macOS support is expected from the underlying POSIX APIs but remains pending runtime validation.
+The crate uses Unix signals and process groups. Linux and arm64 macOS are tested in CI. Runtime validation has also been completed on macOS 15.5 on Apple Silicon. Windows and other Unix platforms are not currently supported.
