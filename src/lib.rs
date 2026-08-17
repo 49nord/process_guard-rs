@@ -1,23 +1,8 @@
-//! Process guard
-//!
-//! A process guard takes ownership of a `process::Child` and gently or forcefully kills it upon,
-//! prevent the process from running on. Example:
-//!
-//! ```rust
-//! use process_guard::ProcessGuard;
-//! use std::process;
-//!
-//! fn insomnia() {
-//!     let pg = ProcessGuard::spawn(process::Command::new("sleep").arg("120"));
-//!
-//!     // a two-minute sleep process has been started, which will be killed as soon as this
-//!     // function returns
-//! }
-//! ```
+#![doc = include_str!("../README.md")]
 
 use std::{io, os::unix::process::CommandExt, process, thread, time};
 
-/// Retry an IO operation if it returns with `EINTR`.
+/// Retries an I/O operation if it returns with `EINTR`.
 #[inline]
 fn io_retry<T, F: FnMut() -> io::Result<T>>(mut f: F) -> io::Result<T> {
     // FIXME: do we really need/want `FnMut` here?
@@ -29,7 +14,7 @@ fn io_retry<T, F: FnMut() -> io::Result<T>>(mut f: F) -> io::Result<T> {
     }
 }
 
-/// Interval used when polling, waiting for a process to exit
+/// Defines the interval used while polling for process exit.
 const POLL_INTERVAL: time::Duration = time::Duration::from_millis(100);
 
 /// Identifies a signal that can be sent to a guarded process.
@@ -115,11 +100,10 @@ enum Target {
     ProcessGroup(nix::unistd::Pid),
 }
 
-/// Protects a process from becoming an orphan or zombie by killing it when the guard is dropped
+/// Owns a child process and shuts it down when dropped.
 #[derive(Debug)]
 pub struct ProcessGuard {
-    /// Child process. The process might be removed prematurely, in which case we do not kill
-    /// anything
+    /// Direct child owned by the guard.
     child: Option<process::Child>,
 
     /// Policy used when shutting down the process.
@@ -155,21 +139,21 @@ impl ProcessGuard {
         self.child.as_ref().map(process::Child::id)
     }
 
-    /// Retrieves the child process from the process guard
+    /// Removes and returns the direct child without shutting it down.
     pub fn take(&mut self) -> Option<process::Child> {
         self.child.take()
     }
 
-    /// Spawns a command
+    /// Spawns a command with forceful shutdown.
     ///
-    /// Equivalent to calling `cmd.spawn()`, followed by `new`.
+    /// Equivalent to spawning `cmd` and calling [`ProcessGuard::new`] without a grace period.
     pub fn spawn(cmd: &mut process::Command) -> io::Result<ProcessGuard> {
         Self::spawn_with_policy(cmd, ShutdownPolicy::Kill)
     }
 
-    /// Spawns a command with a grace timeout
+    /// Spawns a command with graceful `SIGTERM` shutdown.
     ///
-    /// Equivalent to calling `cmd.spawn()`, followed by `new`.
+    /// Equivalent to spawning `cmd` and calling [`ProcessGuard::new`] with `grace_time`.
     pub fn spawn_graceful(
         cmd: &mut process::Command,
         grace_time: time::Duration,
