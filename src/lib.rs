@@ -426,7 +426,12 @@ impl Drop for ProcessGuard {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io, io::Read, process, thread, time};
+    use std::{
+        fs,
+        io::{self, Read, Write},
+        os::unix::process::CommandExt,
+        process, thread, time,
+    };
 
     use super::{DEFAULT_GRACE_TIME, ProcessGuard, ShutdownPolicy, Signal, grace_poll_delay};
 
@@ -637,64 +642,74 @@ mod tests {
         Ok(())
     }
 
+    /// Verifies that group shutdown reaches a member after the leader has been reaped.
     #[test]
     fn process_group_shutdown_kills_descendants_after_leader_exit() -> io::Result<()> {
-        let pid_file =
-            std::env::temp_dir().join(format!("process-guard-{}-orphan-child.pid", process::id()));
-        let _ = fs::remove_file(&pid_file);
-
-        let mut command = process::Command::new("sh");
-        command
+        let mut leader_command = process::Command::new("sh");
+        leader_command
             .arg("-c")
-            .arg(
-                "sh -c 'trap \"\" TERM; printf \"%s\" \"$$\" > \"$1\"; \
-                 while :; do :; done' sh \"$1\" & \
-                 while [ ! -s \"$1\" ]; do :; done",
-            )
-            .arg("sh")
-            .arg(&pid_file);
-        let mut guard = ProcessGuard::spawn_process_group(
-            &mut command,
+            .arg("read _")
+            .stdin(process::Stdio::piped());
+        let mut leader_guard = ProcessGuard::spawn_process_group(
+            &mut leader_command,
             ShutdownPolicy::Graceful {
                 signal: Signal::SIGTERM,
                 grace_time: time::Duration::from_millis(50),
             },
         )?;
+        let process_group = leader_guard.id().expect("the guard owns the group leader");
 
+        let mut member_command = process::Command::new("sh");
+        member_command
+            .arg("-c")
+            .arg("trap '' TERM; printf ready; exec sleep 60")
+            .stdout(process::Stdio::piped())
+            .process_group(process_group as i32);
+        let mut member = member_command.spawn()?;
+        let mut ready = [0; 5];
+        member
+            .stdout
+            .take()
+            .expect("stdout was configured to be piped")
+            .read_exact(&mut ready)?;
+        assert_eq!(&ready, b"ready");
+        let mut member_guard = ProcessGuard::with_policy(member, ShutdownPolicy::Kill);
+
+        leader_guard
+            .child
+            .as_mut()
+            .expect("the guard owns the group leader")
+            .stdin
+            .take()
+            .expect("stdin was configured to be piped")
+            .write_all(b"\n")?;
         let started = time::Instant::now();
-        let descendant = loop {
-            if let Ok(pid) = fs::read_to_string(&pid_file) {
-                break nix::unistd::Pid::from_raw(pid.parse().map_err(io::Error::other)?);
+        loop {
+            let leader = leader_guard
+                .child
+                .as_mut()
+                .expect("the guard owns the group leader");
+            if leader.try_wait()?.is_some() {
+                break;
             }
             if started.elapsed() >= time::Duration::from_secs(1) {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "descendant did not report its PID",
+                    "group leader did not exit",
                 ));
             }
             thread::sleep(time::Duration::from_millis(10));
-        };
+        }
 
-        let status = guard
+        let leader_status = leader_guard
             .shutdown()?
             .expect("the guard still owns the completed group leader");
-        let started = time::Instant::now();
-        let descendant_alive = loop {
-            if nix::sys::signal::kill(descendant, None).is_err() {
-                break false;
-            }
-            if started.elapsed() >= time::Duration::from_secs(1) {
-                break true;
-            }
-            thread::sleep(time::Duration::from_millis(10));
-        };
-        if descendant_alive {
-            let _ = nix::sys::signal::kill(descendant, nix::sys::signal::Signal::SIGKILL);
-        }
-        fs::remove_file(pid_file)?;
+        let member_status = member_guard
+            .wait()?
+            .expect("the guard still owns the process-group member");
 
-        assert!(status.success());
-        assert!(!descendant_alive);
+        assert!(leader_status.success());
+        assert!(!member_status.success());
         Ok(())
     }
 
