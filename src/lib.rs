@@ -18,9 +18,8 @@
 #[macro_use]
 extern crate log;
 extern crate nix;
-extern crate ticktock;
 
-use std::{io, process, time};
+use std::{io, process, thread, time};
 
 /// Retry an IO operation if it returns with `EINTR`.
 #[inline]
@@ -126,15 +125,19 @@ fn shutdown_child(
         )
         .map_err(io::Error::other)?;
 
-        for _ in ticktock::clock::Clock::new(POLL_INTERVAL)
-            .rel_iter()
-            .take_while(|(_, elapsed)| elapsed <= &grace_time)
-        {
+        let started = time::Instant::now();
+        loop {
             match io_retry(|| child.try_wait()) {
-                Ok(None) => continue,
+                Ok(None) => {}
                 Ok(Some(status)) => return Ok(status),
                 Err(_) => break,
             }
+
+            let remaining = grace_time.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            thread::sleep(POLL_INTERVAL.min(remaining));
         }
     }
 
