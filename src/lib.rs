@@ -457,6 +457,64 @@ mod tests {
         Ok(())
     }
 
+    /// Verifies that graceful shutdown observes its deadline without a full polling overshoot.
+    #[test]
+    fn graceful_shutdown_honors_its_deadline() -> io::Result<()> {
+        let grace_time = time::Duration::from_millis(250);
+        let scheduler_tolerance = time::Duration::from_millis(90);
+        let mut command = process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("trap '' TERM; printf ready; exec sleep 60")
+            .stdout(process::Stdio::piped());
+        let mut child = command.spawn()?;
+
+        let mut ready = [0; 5];
+        child
+            .stdout
+            .take()
+            .expect("stdout was configured to be piped")
+            .read_exact(&mut ready)?;
+        assert_eq!(&ready, b"ready");
+
+        let mut guard = ProcessGuard::new(child, Some(grace_time));
+        let started = time::Instant::now();
+        let status = guard
+            .shutdown()?
+            .expect("the guard still owns the running child");
+        let elapsed = started.elapsed();
+
+        assert!(!status.success());
+        assert!(
+            elapsed >= grace_time,
+            "shutdown completed before the grace period: {elapsed:?}"
+        );
+        assert!(
+            elapsed < grace_time + scheduler_tolerance,
+            "shutdown exceeded the grace period and scheduler tolerance: {elapsed:?}"
+        );
+        Ok(())
+    }
+
+    /// Verifies that a process-group child becomes its dedicated group leader.
+    #[test]
+    fn process_group_uses_child_pid_as_group_id() -> io::Result<()> {
+        let mut command = process::Command::new("sleep");
+        command.arg("60");
+        let mut guard = ProcessGuard::spawn_process_group(&mut command, ShutdownPolicy::Kill)?;
+        let child =
+            nix::unistd::Pid::from_raw(guard.id().expect("the guard owns the child") as i32);
+
+        let process_group = nix::unistd::getpgid(Some(child)).map_err(io::Error::from)?;
+        let status = guard
+            .shutdown()?
+            .expect("the guard still owns the running child");
+
+        assert_eq!(process_group, child);
+        assert!(!status.success());
+        Ok(())
+    }
+
     #[test]
     fn process_group_shutdown_reaches_descendants() -> io::Result<()> {
         let pid_file =
