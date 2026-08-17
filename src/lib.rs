@@ -89,60 +89,57 @@ impl ProcessGuard {
         Ok(unsafe { Self::new(child, Some(grace_time)) })
     }
 
-    /// Shut the process down
+    /// Shuts the process down and reaps it.
     ///
-    /// Calling `shutdown()` on a guard whose process has already exited is a no-op. Note that
-    /// a process whose shutdown failed is also considered shutdown, even though it might still be
-    /// running.
+    /// Returns `None` if the guard no longer owns a process. If shutdown fails, the process remains
+    /// guarded so the operation can be retried.
     pub fn shutdown(&mut self) -> io::Result<Option<process::ExitStatus>> {
-        // remove child from parent struct to satisfy the borrow checker
-        let mut child_opt = self.take();
+        let Some(child) = self.child.as_mut() else {
+            return Ok(None);
+        };
 
-        if let Some(ref mut child) = child_opt {
-            // NOTE: we assume that it is impossible for a child's PID to be reused before it has
-            //       been reaped, i.e. since we are the first to call `wait` on it, we should never
-            //       kill the wrong process
-
-            // upon drop, we terminate, then kill the child
-            if let Some(grace_time) = self.grace_time {
-                // send SIGKILL, we ignore the result of the kill call, we cannot do anything about
-                // any Err. According to the kill(2) manpage, EINTR is not possible when calling
-                // kill().
-                nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(child.id() as i32),
-                    nix::sys::signal::Signal::SIGTERM,
-                )
-                .map_err(io::Error::other)?;
-
-                // until we reach `grace_time`, try to reap the child in POLL_INTERVAL intervals
-                for _ in ticktock::clock::Clock::new(POLL_INTERVAL)
-                    .rel_iter()
-                    .take_while(|(_, t)| t <= &grace_time)
-                {
-                    match io_retry(|| child.try_wait()) {
-                        // process did not exit yet, keep polling
-                        Ok(None) => continue,
-                        // process did exit, we are done
-                        Ok(Some(status)) => {
-                            return Ok(Some(status));
-                        }
-                        // error occured - we won't keep trying to wait, but will make another
-                        // effort using SIGKILL
-                        Err(_) => break,
-                    }
-                }
+        let result = shutdown_child(child, self.grace_time);
+        match result {
+            Ok(status) => {
+                self.child.take();
+                Ok(Some(status))
             }
-
-            // SIGTERM was either not requested or unsuccessful, proceed with SIGKILL
-            // if SIGKILL fails, we keep the child around, but do not wait on it
-            io_retry(|| child.kill())?;
-
-            // now wait is bound work. if it fails, we give up
-            Ok(Some(io_retry(|| child.wait())?))
-        } else {
-            Ok(None)
+            Err(error) => Err(error),
         }
     }
+}
+
+/// Shuts down and reaps an owned child process.
+fn shutdown_child(
+    child: &mut process::Child,
+    grace_time: Option<time::Duration>,
+) -> io::Result<process::ExitStatus> {
+    if let Some(status) = io_retry(|| child.try_wait())? {
+        return Ok(status);
+    }
+
+    // An unreaped child retains its PID, so it cannot be reused between this check and wait.
+    if let Some(grace_time) = grace_time {
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child.id() as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .map_err(io::Error::other)?;
+
+        for _ in ticktock::clock::Clock::new(POLL_INTERVAL)
+            .rel_iter()
+            .take_while(|(_, elapsed)| elapsed <= &grace_time)
+        {
+            match io_retry(|| child.try_wait()) {
+                Ok(None) => continue,
+                Ok(Some(status)) => return Ok(status),
+                Err(_) => break,
+            }
+        }
+    }
+
+    io_retry(|| child.kill())?;
+    io_retry(|| child.wait())
 }
 
 impl Drop for ProcessGuard {
@@ -153,5 +150,50 @@ impl Drop for ProcessGuard {
         if let Err(e) = self.shutdown() {
             warn!("Could not cleanly kill PID {}: {:?}", pid, e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io, io::Read, process, time};
+
+    use super::ProcessGuard;
+
+    #[test]
+    fn shutdown_reaps_a_completed_child() -> io::Result<()> {
+        let mut command = process::Command::new("true");
+        command.stdout(process::Stdio::piped());
+        let mut child = command.spawn()?;
+
+        let mut output = Vec::new();
+        child
+            .stdout
+            .take()
+            .expect("stdout was configured to be piped")
+            .read_to_end(&mut output)?;
+
+        let mut guard = unsafe { ProcessGuard::new(child, Some(time::Duration::from_secs(1))) };
+        let status = guard
+            .shutdown()?
+            .expect("the guard still owns the completed child");
+
+        assert!(status.success());
+        assert!(guard.shutdown()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_kills_and_reaps_a_running_child() -> io::Result<()> {
+        let mut command = process::Command::new("sleep");
+        command.arg("60");
+        let mut guard = ProcessGuard::spawn(&mut command)?;
+
+        let status = guard
+            .shutdown()?
+            .expect("the guard still owns the running child");
+
+        assert!(!status.success());
+        assert!(guard.shutdown()?.is_none());
+        Ok(())
     }
 }
