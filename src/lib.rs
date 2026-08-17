@@ -74,6 +74,38 @@ pub enum ShutdownPolicy {
     },
 }
 
+/// Describes a failure that prevented a guarded child from being shut down.
+#[derive(Debug, thiserror::Error)]
+pub enum ShutdownError {
+    /// Inspecting the child's initial status failed.
+    #[error("failed to inspect the child before shutdown")]
+    Inspect {
+        /// Underlying process error.
+        #[source]
+        source: io::Error,
+    },
+    /// Sending the forceful termination signal failed.
+    #[error("failed to forcefully terminate the child")]
+    Kill {
+        /// Underlying signal error.
+        #[source]
+        source: io::Error,
+    },
+    /// Reaping the terminated child failed.
+    #[error("failed to reap the terminated child")]
+    Wait {
+        /// Underlying process error.
+        #[source]
+        source: io::Error,
+    },
+}
+
+impl From<ShutdownError> for io::Error {
+    fn from(error: ShutdownError) -> Self {
+        Self::other(error)
+    }
+}
+
 /// Identifies the operating-system object that receives shutdown signals.
 #[derive(Clone, Copy, Debug)]
 enum Target {
@@ -234,7 +266,7 @@ impl ProcessGuard {
     ///
     /// Returns `None` if the guard no longer owns a process. If shutdown fails, the process remains
     /// guarded so the operation can be retried.
-    pub fn shutdown(&mut self) -> io::Result<Option<process::ExitStatus>> {
+    pub fn shutdown(&mut self) -> Result<Option<process::ExitStatus>, ShutdownError> {
         let Some(child) = self.child.as_mut() else {
             return Ok(None);
         };
@@ -255,8 +287,10 @@ fn shutdown_child(
     child: &mut process::Child,
     policy: ShutdownPolicy,
     target: Target,
-) -> io::Result<process::ExitStatus> {
-    if let Some(status) = io_retry(|| child.try_wait())? {
+) -> Result<process::ExitStatus, ShutdownError> {
+    if let Some(status) =
+        io_retry(|| child.try_wait()).map_err(|source| ShutdownError::Inspect { source })?
+    {
         return Ok(status);
     }
 
@@ -285,10 +319,10 @@ fn shutdown_child(
     }
 
     match send_signal(child, target, Signal::Kill) {
-        Ok(()) => io_retry(|| child.wait()),
+        Ok(()) => io_retry(|| child.wait()).map_err(|source| ShutdownError::Wait { source }),
         Err(kill_error) => match io_retry(|| child.try_wait()) {
             Ok(Some(status)) => Ok(status),
-            Ok(None) | Err(_) => Err(kill_error),
+            Ok(None) | Err(_) => Err(ShutdownError::Kill { source: kill_error }),
         },
     }
 }
