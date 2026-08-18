@@ -1,6 +1,6 @@
 # process_guard
 
-`process_guard` provides two-stage process cleanup for synchronous code through RAII. On `Drop`, it sends a configurable graceful signal (`SIGTERM` by default), waits for a bounded interval, escalates to `SIGKILL`, and reaps the direct child; the same operation is available explicitly and can target a child or dedicated process group.
+`process_guard` provides two-stage process cleanup for synchronous code through RAII. On `Drop`, it sends a configurable graceful signal (`SIGTERM` by default), waits for a bounded interval, escalates to `SIGKILL`, and waits for bounded cleanup; the same operation is available explicitly and can target a child or dedicated process group.
 
 ```rust,no_run
 use process_guard::ProcessGuard;
@@ -27,6 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let policy = ShutdownPolicy::Graceful {
         signal: Signal::SIGINT,
         grace_time: Duration::from_secs(5),
+        force_time: Duration::from_secs(1),
     };
     let mut command = Command::new("postgres");
     command.arg("-D").arg("database");
@@ -37,17 +38,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`ProcessGuard::shutdown` reports cleanup errors and retains ownership when cleanup fails, allowing another attempt. `Drop` uses the same bounded shutdown operation as a best-effort fallback.
+`grace_time` limits cooperative shutdown and `force_time` limits waiting after `SIGKILL`. `ProcessGuard::shutdown` reports cleanup errors and retains ownership when cleanup fails, allowing another attempt. `Drop` uses the same bounded shutdown operation as a best-effort fallback.
 
 ## Process groups
 
-`ProcessGuard::spawn_process_group` starts the direct child as the leader of a dedicated process group. `ShutdownPolicy::Graceful` asks the direct child to coordinate shutdown, while `ShutdownPolicy::GracefulProcessGroup` broadcasts the graceful signal. Forceful fallback always signals the complete group. The guard reaps the direct child.
+`ProcessGuard::spawn_process_group` starts the direct child as the leader of a dedicated process group. `ShutdownPolicy::Graceful` asks the direct child to coordinate shutdown, while `ShutdownPolicy::GracefulProcessGroup` broadcasts the graceful signal. Forceful fallback always signals the complete group. Successful shutdown means the direct child was reaped and the group disappeared.
 
 `GracefulProcessGroup` broadcasts only when the guard created and owns a dedicated group. On a direct-child guard it behaves like `Graceful`; the guard never discovers or signals the child's inherited process group, which could also contain the caller or its parent.
 
 `take` returns the direct child and relinquishes all cleanup responsibility, including cleanup of an owned process group.
 
-The guard reaps only the direct child. After forceful shutdown it returns once `SIGKILL` has been sent to the process group and the direct child has been reaped; other members may remain briefly visible while termination and reaping complete.
+The guard reaps only the direct child. Other group members are reaped by their respective parents; the guard polls for group disappearance rather than reaping them itself.
 
 Process-group containment is cooperative. Descendants can escape cleanup by joining another process group with `setpgid` or starting another session with `setsid`.
 

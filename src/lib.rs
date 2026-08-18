@@ -17,12 +17,15 @@ fn io_retry<T, F: FnMut() -> io::Result<T>>(mut f: F) -> io::Result<T> {
 /// Maximum time allowed for graceful shutdown by the default policy.
 pub const DEFAULT_GRACE_TIME: time::Duration = time::Duration::from_secs(10);
 
+/// Maximum time allowed for forceful shutdown by the default policy.
+pub const DEFAULT_FORCE_TIME: time::Duration = time::Duration::from_secs(1);
+
 /// Defines the interval used while polling for process exit.
 const POLL_INTERVAL: time::Duration = time::Duration::from_millis(100);
 
-/// Calculates the next polling delay before a grace period expires.
-fn grace_poll_delay(grace_time: time::Duration, elapsed: time::Duration) -> Option<time::Duration> {
-    let remaining = grace_time.saturating_sub(elapsed);
+/// Calculates the next polling delay before a deadline expires.
+fn poll_delay(timeout: time::Duration, elapsed: time::Duration) -> Option<time::Duration> {
+    let remaining = timeout.saturating_sub(elapsed);
     (!remaining.is_zero()).then_some(POLL_INTERVAL.min(remaining))
 }
 
@@ -33,13 +36,18 @@ pub type Signal = nix::sys::signal::Signal;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShutdownPolicy {
     /// Forces immediate termination with [`Signal::SIGKILL`].
-    Kill,
+    Kill {
+        /// Maximum time allowed for forceful shutdown.
+        force_time: time::Duration,
+    },
     /// Requests graceful shutdown before forcing termination.
     Graceful {
         /// Signal sent to the direct child to request graceful shutdown.
         signal: Signal,
         /// Maximum time allowed for graceful shutdown.
         grace_time: time::Duration,
+        /// Maximum time allowed for forceful shutdown.
+        force_time: time::Duration,
     },
     /// Requests graceful shutdown from the complete guarded target before forcing termination.
     ///
@@ -51,6 +59,8 @@ pub enum ShutdownPolicy {
         signal: Signal,
         /// Maximum time allowed for graceful shutdown.
         grace_time: time::Duration,
+        /// Maximum time allowed for forceful shutdown.
+        force_time: time::Duration,
     },
 }
 
@@ -59,6 +69,7 @@ impl Default for ShutdownPolicy {
         Self::Graceful {
             signal: Signal::SIGTERM,
             grace_time: DEFAULT_GRACE_TIME,
+            force_time: DEFAULT_FORCE_TIME,
         }
     }
 }
@@ -86,6 +97,12 @@ pub enum ShutdownError {
         /// Underlying process error.
         #[source]
         source: io::Error,
+    },
+    /// Forceful shutdown did not complete before its deadline.
+    #[error("forceful shutdown timed out after {timeout:?}")]
+    Timeout {
+        /// Configured forceful shutdown timeout.
+        timeout: time::Duration,
     },
 }
 
@@ -119,13 +136,19 @@ pub struct ProcessGuard {
 
 impl ProcessGuard {
     /// Creates a guard for an existing child process.
+    ///
+    /// Forceful shutdown uses [`DEFAULT_FORCE_TIME`].
     pub fn new(child: process::Child, grace_time: Option<time::Duration>) -> ProcessGuard {
-        let policy = grace_time.map_or(ShutdownPolicy::Kill, |grace_time| {
-            ShutdownPolicy::Graceful {
+        let policy = grace_time.map_or(
+            ShutdownPolicy::Kill {
+                force_time: DEFAULT_FORCE_TIME,
+            },
+            |grace_time| ShutdownPolicy::Graceful {
                 signal: Signal::SIGTERM,
                 grace_time,
-            }
-        });
+                force_time: DEFAULT_FORCE_TIME,
+            },
+        );
         Self::with_policy(child, policy)
     }
 
@@ -155,7 +178,8 @@ impl ProcessGuard {
 
     /// Spawns a command with graceful `SIGTERM` shutdown.
     ///
-    /// Equivalent to spawning `cmd` and calling [`ProcessGuard::new`] with `grace_time`.
+    /// Equivalent to spawning `cmd` and calling [`ProcessGuard::new`] with `grace_time`. Forceful
+    /// shutdown uses [`DEFAULT_FORCE_TIME`].
     pub fn spawn_graceful(
         cmd: &mut process::Command,
         grace_time: time::Duration,
@@ -165,6 +189,7 @@ impl ProcessGuard {
             ShutdownPolicy::Graceful {
                 signal: Signal::SIGTERM,
                 grace_time,
+                force_time: DEFAULT_FORCE_TIME,
             },
         )
     }
@@ -288,7 +313,7 @@ fn shutdown_direct_child(
                     Err(_) => break,
                 }
 
-                let Some(delay) = grace_poll_delay(grace_time, started.elapsed()) else {
+                let Some(delay) = poll_delay(grace_time, started.elapsed()) else {
                     break;
                 };
                 thread::sleep(delay);
@@ -298,7 +323,7 @@ fn shutdown_direct_child(
         }
     }
 
-    force_shutdown(child, Target::Child)
+    force_shutdown(child, Target::Child, force_time(policy), None)
 }
 
 /// Shuts down a process group and reaps its direct child.
@@ -314,7 +339,7 @@ fn shutdown_process_group(
         let graceful_target = match policy {
             ShutdownPolicy::Graceful { .. } => Target::Child,
             ShutdownPolicy::GracefulProcessGroup { .. } => target,
-            ShutdownPolicy::Kill => unreachable!("graceful policy was checked above"),
+            ShutdownPolicy::Kill { .. } => unreachable!("graceful policy was checked above"),
         };
         let _ = send_signal(child, graceful_target, signal);
         let started = time::Instant::now();
@@ -333,47 +358,85 @@ fn shutdown_process_group(
                 return Ok(status);
             }
 
-            let Some(delay) = grace_poll_delay(grace_time, started.elapsed()) else {
+            let Some(delay) = poll_delay(grace_time, started.elapsed()) else {
                 break;
             };
             thread::sleep(delay);
         }
     }
 
-    let kill_result = send_signal(child, target, Signal::SIGKILL);
-    if let Err(kill_error) = kill_result {
-        let group_exists = process_group_exists(process_group).unwrap_or(true);
-        if group_exists {
-            return Err(ShutdownError::Kill { source: kill_error });
-        }
-    }
-
-    match child_status {
-        Some(status) => Ok(status),
-        None => io_retry(|| child.wait()).map_err(|source| ShutdownError::Wait { source }),
-    }
+    force_shutdown(child, target, force_time(policy), child_status)
 }
 
 /// Returns the graceful signal and grace period configured by a policy.
 fn graceful_shutdown(policy: ShutdownPolicy) -> Option<(Signal, time::Duration)> {
     match policy {
-        ShutdownPolicy::Kill => None,
-        ShutdownPolicy::Graceful { signal, grace_time }
-        | ShutdownPolicy::GracefulProcessGroup { signal, grace_time } => Some((signal, grace_time)),
+        ShutdownPolicy::Kill { .. } => None,
+        ShutdownPolicy::Graceful {
+            signal, grace_time, ..
+        }
+        | ShutdownPolicy::GracefulProcessGroup {
+            signal, grace_time, ..
+        } => Some((signal, grace_time)),
     }
 }
 
-/// Forces a direct child or process group to stop and reaps the direct child.
+/// Returns the forceful shutdown timeout configured by a policy.
+fn force_time(policy: ShutdownPolicy) -> time::Duration {
+    match policy {
+        ShutdownPolicy::Kill { force_time }
+        | ShutdownPolicy::Graceful { force_time, .. }
+        | ShutdownPolicy::GracefulProcessGroup { force_time, .. } => force_time,
+    }
+}
+
+/// Forces a target to stop and waits for bounded cleanup completion.
 fn force_shutdown(
     child: &mut process::Child,
     target: Target,
+    force_time: time::Duration,
+    mut child_status: Option<process::ExitStatus>,
 ) -> Result<process::ExitStatus, ShutdownError> {
-    match send_signal(child, target, Signal::SIGKILL) {
-        Ok(()) => io_retry(|| child.wait()).map_err(|source| ShutdownError::Wait { source }),
-        Err(kill_error) => match io_retry(|| child.try_wait()) {
-            Ok(Some(status)) => Ok(status),
-            Ok(None) | Err(_) => Err(ShutdownError::Kill { source: kill_error }),
-        },
+    if let Err(kill_error) = send_signal(child, target, Signal::SIGKILL) {
+        let stopped = match target {
+            Target::Child => match io_retry(|| child.try_wait()) {
+                Ok(status) => {
+                    child_status = status;
+                    child_status.is_some()
+                }
+                Err(_) => false,
+            },
+            Target::ProcessGroup(process_group) => {
+                !process_group_exists(process_group).unwrap_or(true)
+            }
+        };
+        if !stopped {
+            return Err(ShutdownError::Kill { source: kill_error });
+        }
+    }
+
+    let started = time::Instant::now();
+    loop {
+        if child_status.is_none() {
+            child_status =
+                io_retry(|| child.try_wait()).map_err(|source| ShutdownError::Wait { source })?;
+        }
+
+        let target_stopped = match target {
+            Target::Child => child_status.is_some(),
+            Target::ProcessGroup(process_group) => !process_group_exists(process_group)
+                .map_err(|source| ShutdownError::Inspect { source })?,
+        };
+        if target_stopped && let Some(status) = child_status {
+            return Ok(status);
+        }
+
+        let Some(delay) = poll_delay(force_time, started.elapsed()) else {
+            return Err(ShutdownError::Timeout {
+                timeout: force_time,
+            });
+        };
+        thread::sleep(delay);
     }
 }
 
@@ -417,7 +480,10 @@ mod tests {
         process, thread, time,
     };
 
-    use super::{DEFAULT_GRACE_TIME, ProcessGuard, ShutdownPolicy, Signal, grace_poll_delay};
+    use super::{
+        DEFAULT_FORCE_TIME, DEFAULT_GRACE_TIME, ProcessGuard, ShutdownError, ShutdownPolicy,
+        Signal, poll_delay,
+    };
 
     #[test]
     fn default_policy_gracefully_terminates_for_ten_seconds() {
@@ -426,9 +492,11 @@ mod tests {
             ShutdownPolicy::Graceful {
                 signal: Signal::SIGTERM,
                 grace_time: DEFAULT_GRACE_TIME,
+                force_time: DEFAULT_FORCE_TIME,
             }
         );
         assert_eq!(DEFAULT_GRACE_TIME, time::Duration::from_secs(10));
+        assert_eq!(DEFAULT_FORCE_TIME, time::Duration::from_secs(1));
     }
 
     #[test]
@@ -476,6 +544,7 @@ mod tests {
             ShutdownPolicy::Graceful {
                 signal: Signal::SIGINT,
                 grace_time: time::Duration::from_secs(1),
+                force_time: DEFAULT_FORCE_TIME,
             },
         );
         let status = guard
@@ -542,16 +611,16 @@ mod tests {
         let grace_time = time::Duration::from_millis(250);
 
         assert_eq!(
-            grace_poll_delay(grace_time, time::Duration::ZERO),
+            poll_delay(grace_time, time::Duration::ZERO),
             Some(time::Duration::from_millis(100))
         );
         assert_eq!(
-            grace_poll_delay(grace_time, time::Duration::from_millis(225)),
+            poll_delay(grace_time, time::Duration::from_millis(225)),
             Some(time::Duration::from_millis(25))
         );
-        assert_eq!(grace_poll_delay(grace_time, grace_time), None);
+        assert_eq!(poll_delay(grace_time, grace_time), None);
         assert_eq!(
-            grace_poll_delay(grace_time, time::Duration::from_millis(300)),
+            poll_delay(grace_time, time::Duration::from_millis(300)),
             None
         );
     }
@@ -561,7 +630,12 @@ mod tests {
     fn process_group_uses_child_pid_as_group_id() -> io::Result<()> {
         let mut command = process::Command::new("sleep");
         command.arg("60");
-        let mut guard = ProcessGuard::spawn_process_group(&mut command, ShutdownPolicy::Kill)?;
+        let mut guard = ProcessGuard::spawn_process_group(
+            &mut command,
+            ShutdownPolicy::Kill {
+                force_time: DEFAULT_FORCE_TIME,
+            },
+        )?;
         let child =
             nix::unistd::Pid::from_raw(guard.id().expect("the guard owns the child") as i32);
 
@@ -572,6 +646,56 @@ mod tests {
 
         assert_eq!(process_group, child);
         assert!(!status.success());
+        Ok(())
+    }
+
+    #[test]
+    fn forceful_shutdown_timeout_retains_the_guard() -> io::Result<()> {
+        let force_time = time::Duration::from_millis(150);
+        let scheduler_tolerance = time::Duration::from_millis(300);
+        let mut leader_command = process::Command::new("sh");
+        leader_command
+            .arg("-c")
+            .arg("read _")
+            .stdin(process::Stdio::piped());
+        let mut guard = ProcessGuard::spawn_process_group(
+            &mut leader_command,
+            ShutdownPolicy::Kill { force_time },
+        )?;
+        let process_group = guard.id().expect("the guard owns the group leader");
+
+        let mut member_command = process::Command::new("sh");
+        member_command
+            .arg("-c")
+            .arg("printf ready; exec sleep 60")
+            .stdout(process::Stdio::piped())
+            .process_group(process_group as i32);
+        let mut member = member_command.spawn()?;
+        let mut ready = [0; 5];
+        member
+            .stdout
+            .take()
+            .expect("stdout was configured to be piped")
+            .read_exact(&mut ready)?;
+        assert_eq!(&ready, b"ready");
+
+        let started = time::Instant::now();
+        let error = guard
+            .shutdown()
+            .expect_err("the unreaped group member must keep the group alive");
+        let elapsed = started.elapsed();
+
+        assert!(matches!(error, ShutdownError::Timeout { timeout } if timeout == force_time));
+        assert!(guard.id().is_some());
+        assert!(elapsed >= force_time);
+        assert!(elapsed < force_time + scheduler_tolerance);
+
+        let member_status = member.wait()?;
+        let leader_status = guard
+            .shutdown()?
+            .expect("the guard must retain the reaped group leader");
+        assert!(!member_status.success());
+        assert!(!leader_status.success());
         Ok(())
     }
 
@@ -595,6 +719,7 @@ mod tests {
             ShutdownPolicy::GracefulProcessGroup {
                 signal: Signal::SIGTERM,
                 grace_time: time::Duration::from_secs(1),
+                force_time: DEFAULT_FORCE_TIME,
             },
         )?;
 
@@ -639,6 +764,7 @@ mod tests {
             ShutdownPolicy::Graceful {
                 signal: Signal::SIGTERM,
                 grace_time: time::Duration::from_millis(50),
+                force_time: DEFAULT_FORCE_TIME,
             },
         )?;
         let process_group = leader_guard.id().expect("the guard owns the group leader");
@@ -657,7 +783,7 @@ mod tests {
             .expect("stdout was configured to be piped")
             .read_exact(&mut ready)?;
         assert_eq!(&ready, b"ready");
-        let mut member_guard = ProcessGuard::with_policy(member, ShutdownPolicy::Kill);
+        let member_waiter = thread::spawn(move || member.wait());
 
         leader_guard
             .child
@@ -688,10 +814,9 @@ mod tests {
         let leader_status = leader_guard
             .shutdown()?
             .expect("the guard still owns the completed group leader");
-        let member_status = member_guard
-            .take()
-            .expect("the guard still owns the process-group member")
-            .wait()?;
+        let member_status = member_waiter
+            .join()
+            .expect("the process-group member waiter must not panic")?;
 
         assert!(leader_status.success());
         assert!(!member_status.success());
